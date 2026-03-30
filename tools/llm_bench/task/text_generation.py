@@ -271,10 +271,14 @@ def run_text_generation_genai(input_text, num, model, tokenizer, args, iter_data
         mem_consumption.start()
 
     max_gen_tokens = DEFAULT_OUTPUT_TOKEN_SIZE if args['infer_count'] is None else args['infer_count']
+    t_get_tokenizer_start = datetime.datetime.now()
     tokenizer = model.get_tokenizer()
+    t_get_tokenizer_end = datetime.datetime.now()
     if args['apply_chat_template']:
         input_text_hist = [{'role': 'user', 'content': input_text}]
+        t_chat_template_start = datetime.datetime.now()
         templated_input_text = tokenizer.apply_chat_template(input_text_hist, add_generation_prompt=True)
+        t_chat_template_end = datetime.datetime.now()
         input_text_list = [templated_input_text] * args['batch_size']
         if not args["disable_prompt_permutation"]:
             log.warning(
@@ -282,13 +286,19 @@ def run_text_generation_genai(input_text, num, model, tokenizer, args, iter_data
                 "It means that after applying the chat template prompt will be tokenized and mixed, so the structure of chat template will not be kept. "
                 "If it is not expected, please specify --disable_prompt_permutation in your benchmarking command to disable this behavior"
             )
+    else:
+        t_chat_template_start = t_get_tokenizer_end
+        t_chat_template_end = t_get_tokenizer_end
 
     tokenization_start = time.perf_counter()
+    t_encode_start = datetime.datetime.now()
     input_data = tokenizer.encode(input_text_list)
+    t_encode_end = datetime.datetime.now()
     tokenization_end = time.perf_counter()
     tokenization_time = [(tokenization_end - tokenization_start) * 1000]
 
     enable_prompt_permutations = not args.get("disable_prompt_permutation", False)
+    t_permutation_start = datetime.datetime.now()
     if enable_prompt_permutations:
         log.warning(
             "Enabled input prompt permutations. It means that generated results may vary on different steps. "
@@ -307,6 +317,7 @@ def run_text_generation_genai(input_text, num, model, tokenizer, args, iter_data
                 input_ids[:, 1] = num + 3
         attention_mask = input_data.attention_mask
         input_data = TokenizedInputs(input_ids=ov.Tensor(input_ids), attention_mask=attention_mask)
+    t_permutation_end = datetime.datetime.now()
     num_input_tokens = input_data.input_ids.shape[1]
     if args['batch_size'] > 1:
         out_str = '[warm-up]' if num == 0 else '[{}]'.format(num)
@@ -347,6 +358,12 @@ def run_text_generation_genai(input_text, num, model, tokenizer, args, iter_data
         gen_config.num_assistant_tokens = int(args['num_assistant_tokens'])
         config_info += f"max_ngram_size {gen_config.max_ngram_size}, num_assistant_tokens {gen_config.num_assistant_tokens}"
         log.info(config_info)
+    t_generate_start = datetime.datetime.now()
+    log.info(f"llm_bench pre-generate @ {t_generate_start.strftime('%Y-%m-%dT%H:%M:%S.%f')} "
+             f"(get_tokenizer: {(t_get_tokenizer_end - t_get_tokenizer_start).total_seconds() * 1000:.1f}ms, "
+             f"chat_template: {(t_chat_template_end - t_chat_template_start).total_seconds() * 1000:.1f}ms, "
+             f"encode: {(t_encode_end - t_encode_start).total_seconds() * 1000:.1f}ms, "
+             f"permutation: {(t_permutation_end - t_permutation_start).total_seconds() * 1000:.1f}ms)")
     generated_tokens, perf_metrics, generation_time = genai_generate(streaming, model, tokens_len, gen_config,
                                                                      args["empty_lora"], input_data, args['batch_size'])
     if streaming:
