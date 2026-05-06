@@ -3,9 +3,12 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <iostream>
 #include <numeric>
 #include <random>
+#include <sstream>
 #include <vector>
 
 #include "utils.hpp"
@@ -14,6 +17,17 @@
 #include "openvino/genai/streamer_base.hpp"
 
 namespace {
+
+std::string shape_to_string(const ov::Shape& s) {
+    std::ostringstream oss;
+    oss << '[';
+    for (size_t i = 0; i < s.size(); ++i) {
+        if (i) oss << ',';
+        oss << s[i];
+    }
+    oss << ']';
+    return oss.str();
+}
 
 /**
  * Set position ids tensor data for next token inference based on provided attention mask
@@ -179,6 +193,18 @@ ov::genai::utils::GenerationFinishInfo get_lm_encoded_results(
 
     // "Prompt" phase
 
+    {
+        const char* dbg = std::getenv("GQA_DBG");
+        if (dbg && dbg[0] != '\0' && !(dbg[0] == '0' && dbg[1] == '\0')) {
+            std::fprintf(stderr,
+                         "[GQA_DBG][lm_encoding:prefill] input_ids=%s, attention_mask=%s, batch=%zu\n",
+                         shape_to_string(input_ids.get_shape()).c_str(),
+                         shape_to_string(attention_mask.get_shape()).c_str(),
+                         batch_size);
+            std::fflush(stderr);
+        }
+    }
+
     const auto infer_start = std::chrono::steady_clock::now();
     m_llm.infer();
 
@@ -186,6 +212,15 @@ ov::genai::utils::GenerationFinishInfo get_lm_encoded_results(
     const auto infer_ms = PerfMetrics::get_microsec(infer_end - infer_start);
     raw_perf_counters.m_inference_durations[0] += MicroSeconds(infer_ms);
     raw_perf_counters.m_token_infer_durations.emplace_back(infer_ms);
+
+    {
+        const char* dbg = std::getenv("GQA_DBG");
+        if (dbg && dbg[0] != '\0' && !(dbg[0] == '0' && dbg[1] == '\0')) {
+            std::fprintf(stderr, "[GQA_DBG][lm_encoding:prefill] infer() done in %.2f ms\n",
+                         infer_ms / 1000.0);
+            std::fflush(stderr);
+        }
+    }
 
     auto logits = m_llm.get_tensor("logits");
 
@@ -305,6 +340,17 @@ ov::genai::utils::GenerationFinishInfo get_lm_encoded_results(
 
         m_llm.set_tensor("beam_idx", ov::Tensor{ov::element::i32, {total_num_tokens}, next_beams.data()});
 
+        {
+            const char* dbg = std::getenv("GQA_DBG");
+            if (dbg && dbg[0] != '\0' && !(dbg[0] == '0' && dbg[1] == '\0')) {
+                std::fprintf(stderr,
+                             "[GQA_DBG][lm_encoding:gen] tokens=%zu, mask=%s, start_async()...\n",
+                             total_num_tokens,
+                             shape_to_string(m_llm.get_tensor("attention_mask").get_shape()).c_str());
+                std::fflush(stderr);
+            }
+        }
+
         const auto infer_start = std::chrono::steady_clock::now();
         m_llm.start_async();
 
@@ -317,6 +363,15 @@ ov::genai::utils::GenerationFinishInfo get_lm_encoded_results(
         const auto infer_ms = PerfMetrics::get_microsec(infer_end - infer_start);
         raw_perf_counters.m_inference_durations[0] += MicroSeconds(infer_ms);
         raw_perf_counters.m_token_infer_durations.emplace_back(infer_ms);
+
+        {
+            const char* dbg = std::getenv("GQA_DBG");
+            if (dbg && dbg[0] != '\0' && !(dbg[0] == '0' && dbg[1] == '\0')) {
+                std::fprintf(stderr, "[GQA_DBG][lm_encoding:gen] wait() done in %.2f ms\n",
+                             infer_ms / 1000.0);
+                std::fflush(stderr);
+            }
+        }
 
         sampler_output = sampler.sample(active_sequence_groups, m_llm.get_tensor("logits"));
         free_non_running_requests(); // handle sampler output

@@ -6,13 +6,46 @@
 #include "sampling/sampler.hpp"
 #include "utils.hpp"
 
+#include <chrono>
+#include <cstdlib>
 #include <fstream>
+#include <iostream>
+#include <sstream>
 
 #include "openvino/runtime/core.hpp"
 #include "openvino/core/parallel.hpp"
 #include "openvino/genai/text_streamer.hpp"
 
+// Deep debug logging — enable with env var GQA_DBG=1 (or any non-empty value).
+// All messages flushed to stderr immediately so a hang shows the last reached point.
+#define GQA_DBG_ENABLED() ([]() -> bool {                                  \
+    static const bool _on = std::getenv("GQA_DBG") != nullptr              \
+                            && std::string(std::getenv("GQA_DBG")) != "0"  \
+                            && std::string(std::getenv("GQA_DBG")) != "";  \
+    return _on;                                                            \
+}())
+
+#define GQA_DBG(expr)                                                                     \
+    do {                                                                                  \
+        if (GQA_DBG_ENABLED()) {                                                          \
+            std::ostringstream _oss;                                                      \
+            _oss << "[GQA_DBG][" << __func__ << ":" << __LINE__ << "] " << expr << '\n';  \
+            std::cerr << _oss.str() << std::flush;                                        \
+        }                                                                                 \
+    } while (0)
+
 namespace {
+
+std::string shape_to_str(const ov::Shape& s) {
+    std::ostringstream oss;
+    oss << '[';
+    for (size_t i = 0; i < s.size(); ++i) {
+        if (i) oss << ',';
+        oss << s[i];
+    }
+    oss << ']';
+    return oss.str();
+}
 
 template <typename T>
 void fill_tensor(ov::Tensor tensor, T fill_val, size_t offset = 0u) {
@@ -106,12 +139,34 @@ StatefulLLMPipeline::StatefulLLMPipeline(
     const ov::genai::GenerationConfig& generation_config
 ) : LLMPipelineImplBase(tokenizer, generation_config),
     m_sampler(m_tokenizer) {
+    GQA_DBG("ctor enter, model name=" << model->get_friendly_name()
+            << ", inputs=" << model->inputs().size()
+            << ", outputs=" << model->outputs().size());
+    if (GQA_DBG_ENABLED()) {
+        for (const auto& in : model->inputs()) {
+            GQA_DBG("  input: " << in.get_any_name()
+                    << " pshape=" << in.get_partial_shape() << " et=" << in.get_element_type());
+        }
+        for (const auto& [k, v] : properties) {
+            GQA_DBG("  prop: " << k << "=" << v.as<std::string>());
+        }
+    }
     auto kv_pos = ov::genai::utils::get_kv_axes_pos(model);
+    GQA_DBG("kv_axes batch=" << kv_pos.batch << " seq_len=" << kv_pos.seq_len);
+    GQA_DBG("compile_decoder_for_npu start");
+    auto compile_t0 = std::chrono::steady_clock::now();
     auto [compiled, kv_desc] = utils::compile_decoder_for_npu(model, properties, kv_pos);
+    auto compile_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - compile_t0).count();
+    GQA_DBG("compile_decoder_for_npu done, " << compile_ms
+            << "ms, max_prompt=" << kv_desc.max_prompt_len
+            << ", min_response=" << kv_desc.min_response_len);
     m_max_prompt_len = kv_desc.max_prompt_len;
     m_kvcache_total = kv_desc.max_prompt_len + kv_desc.min_response_len;
     m_request = compiled.create_infer_request();
+    GQA_DBG("infer_request created");
     m_sampler.set_seed(m_generation_config.rng_seed);
+    GQA_DBG("ctor exit");
 }
 
 DecodedResults StatefulLLMPipeline::generate(
@@ -281,13 +336,23 @@ EncodedResults StatefulLLMPipeline::generate(
     ov::Tensor position_ids{ov::element::i64, input_ids.get_shape()};
     utils::initialize_position_ids(position_ids, attention_mask);
 
+    GQA_DBG("prefill set_tensor: input_ids shape=" << shape_to_str(input_ids.get_shape())
+            << ", attention_mask shape=" << shape_to_str(attention_mask.get_shape())
+            << ", position_ids shape=" << shape_to_str(position_ids.get_shape())
+            << ", prompt_len=" << prompt_len);
     m_request.set_tensor("input_ids", input_ids);
     m_request.set_tensor("attention_mask", attention_mask);
     m_request.set_tensor("position_ids", position_ids);
 
+    GQA_DBG("prefill infer() start");
+    auto prefill_t0 = std::chrono::steady_clock::now();
     m_request.infer();
+    auto prefill_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - prefill_t0).count();
+    GQA_DBG("prefill infer() done, " << prefill_ms << "ms");
 
     auto padded_logits = m_request.get_tensor("logits");
+    GQA_DBG("prefill logits shape=" << shape_to_str(padded_logits.get_shape()));
     // FIXME: Here is workaround to get only useful units of returned logits.
     //        If SliceOut is applied, there will be only 1 useful logit returned,
     //        nothing is required here.
@@ -322,9 +387,11 @@ EncodedResults StatefulLLMPipeline::generate(
     m_request.set_tensor("input_ids", ov::Tensor(ov::element::i64, ov::Shape{1,1},  reinterpret_cast<void*>(&input_ids_data)));
     m_request.set_tensor("position_ids", ov::Tensor(ov::element::i64, ov::Shape{1,1}, reinterpret_cast<void*>(&position_ids_data)));
 
+    size_t gen_iter = 0;
     while (sequence_group->is_running() && !sequence_group->handle_stopped() && !sequence_group->handle_cancelled()) {
         // KV Cache is full, no further generation is possible
         if (position_ids_data + 1 == m_kvcache_total) {
+            GQA_DBG("kvcache full at pos=" << position_ids_data << ", stop");
             sequence_group->set_out_of_memory();
             break;
         }
@@ -341,7 +408,15 @@ EncodedResults StatefulLLMPipeline::generate(
         attention_mask_data.push_back(1);
         m_request.set_tensor("attention_mask", ov::Tensor(ov::element::i64, ov::Shape{1,attention_mask_data.size()}, attention_mask_data.data()));
 
+        GQA_DBG("gen iter=" << gen_iter << " token=" << last_token
+                << " pos=" << position_ids_data
+                << " mask_len=" << attention_mask_data.size() << " infer() start");
+        auto gen_t0 = std::chrono::steady_clock::now();
         m_request.infer();
+        auto gen_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - gen_t0).count();
+        GQA_DBG("gen iter=" << gen_iter << " infer() done, " << gen_ms << "ms");
+        ++gen_iter;
 
         raw_perf_counters.m_new_token_times.emplace_back(std::chrono::steady_clock::now());
         raw_perf_counters.m_batch_sizes.emplace_back(batch_size);
@@ -349,6 +424,7 @@ EncodedResults StatefulLLMPipeline::generate(
         SamplerOutput sampler_output = m_sampler.sample({sequence_group}, m_request.get_tensor("logits"));
         stream_generated_tokens(streamer_ptr, handle);
     }
+    GQA_DBG("generate loop exit, total_iters=" << gen_iter);
 
     if (streamer_ptr) { // push streamer's cache
         streamer_ptr->end();
