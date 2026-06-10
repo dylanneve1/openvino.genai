@@ -784,6 +784,29 @@ def test_rerank_documents(rerank_model, dataset_documents, query, config):
     run_text_rerank_pipeline_with_ref(models_path, query, dataset_documents, config)
 
 
+@pytest.mark.parametrize("rerank_model", [RERANK_TEST_MODELS[0]], indirect=True)
+@pytest.mark.parametrize("query", ["What are the main features of Intel Core Ultra processors?"])
+@pytest.mark.skipif(**should_skip_npuw_tests())
+def test_rerank_documents_npu(rerank_model, dataset_documents, query):
+    # On NPU (NPUW, static batch size 1) the pipeline scores documents one at a time. The
+    # aggregated result must match the batched CPU result, since per-(query, doc) scores are
+    # independent of batching. NPUW_CPU_PROPERTIES runs the NPUW path on CPU for CI.
+    models_path = rerank_model.models_path
+
+    cpu_result = run_text_rerank_genai(models_path, query, dataset_documents)
+
+    npu_reranker = TextRerankPipeline(models_path, "NPU", **NPUW_CPU_PROPERTIES)
+    npu_result = npu_reranker.rerank(query=query, texts=dataset_documents)
+
+    assert_rerank_results(cpu_result, npu_result)
+
+    # the async API goes through the same per-document path on NPU
+    npu_reranker.start_rerank_async(query=query, texts=dataset_documents)
+    npu_async_result = npu_reranker.wait_rerank()
+
+    assert_rerank_results(cpu_result, npu_async_result)
+
+
 # aligned with https://huggingface.co/tomaarsen/Qwen3-Reranker-0.6B-seq-cls#updated-transformers-usage
 @pytest.mark.parametrize("rerank_model", [QWEN3_RERANK_SEQ_CLS], indirect=True)
 @pytest.mark.parametrize("query", ["Which planet is known as the Red Planet?"])

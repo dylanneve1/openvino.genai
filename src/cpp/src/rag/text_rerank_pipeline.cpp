@@ -3,7 +3,9 @@
 
 #include "openvino/genai/rag/text_rerank_pipeline.hpp"
 
+#include <algorithm>
 #include <fstream>
+#include <limits>
 
 #include "debug_utils.hpp"
 #include "json_utils.hpp"
@@ -185,36 +187,97 @@ public:
             model = apply_postprocessing(model);
         }
 
-        // The reranker is an autoregressive decoder, so on NPU it must run through NPUW. Enable
-        // it by default (without requiring the caller to pass an NPU config), letting any
-        // explicitly provided properties take precedence.
-        ov::AnyMap device_properties = properties;
-        if (device == "NPU") {
-            device_properties.insert({"NPU_USE_NPUW", "YES"});
-            device_properties.insert({"NPUW_LLM", "YES"});
+        // The reranker is an autoregressive decoder, so on NPU it must run through NPUW.
+        // compile_decoder_for_npu sets up the NPUW LLM pipeline the same way LLMPipeline does
+        // (and provides BLOB_PATH/EXPORT_BLOB caching), with explicitly provided properties
+        // taking precedence. Match "NPU", "NPU.0", etc.
+        ov::CompiledModel compiled_model;
+        if (device.find("NPU") != std::string::npos) {
+            ov::AnyMap npu_properties = properties;
+            // The reranker only scores the prompt and never generates tokens, so the smallest
+            // response length is enough; it keeps the (unused) generation model minimal.
+            if (npu_properties.count("MIN_RESPONSE_LEN") == 0) {
+                npu_properties["MIN_RESPONSE_LEN"] = 2;
+            }
+            // Size the prefill model to the tokenizer limit when one is configured, so documents
+            // up to max_length tokens fit (the default NPUW prompt length is 1024).
+            if (m_config.max_length && npu_properties.count("MAX_PROMPT_LEN") == 0) {
+                npu_properties["MAX_PROMPT_LEN"] = static_cast<int>(*m_config.max_length);
+            }
+            compiled_model = utils::compile_decoder_for_npu(model, npu_properties, utils::get_kv_axes_pos(model)).first;
+        } else {
+            compiled_model = core.compile_model(model, device, properties);
         }
-
-        ov::CompiledModel compiled_model = core.compile_model(model, device, device_properties);
 
         utils::print_compiled_model_properties(compiled_model, "text rerank model");
         m_request = compiled_model.create_infer_request();
 
         // NPU compiles the model with a static batch dimension of 1 (NPUW only supports batch
-        // size 1). Reranking N documents in a single batched infer would therefore fail, so on
-        // such devices score the documents one at a time and aggregate the results.
-        m_per_document = device == "NPU";
+        // size 1), so when the model actually executes on NPU (covers "NPU", "NPU.0", and
+        // AUTO/MULTI landing on NPU) documents are scored one infer at a time; other devices
+        // score the whole input in a single batched infer.
+        const auto exec_devices = compiled_model.get_property(ov::execution_devices);
+        const bool runs_on_npu = std::any_of(exec_devices.begin(), exec_devices.end(), [](const std::string& d) {
+            return d.find("NPU") != std::string::npos;
+        });
+        m_batch_limit = runs_on_npu ? 1 : std::numeric_limits<size_t>::max();
     };
 
     std::vector<std::pair<size_t, float>> rerank(const std::string& query, const std::vector<std::string>& texts) {
-        if (m_per_document) {
-            return rerank_per_document(query, texts);
-        }
         start_rerank_async(query, texts);
         return wait_rerank();
     }
 
     void start_rerank_async(const std::string& query, const std::vector<std::string>& texts) {
-        const TokenizedInputs& encoded = tokenize(query, texts);
+        m_query = query;
+        m_texts = texts;
+        m_next_doc = 0;
+        m_inflight = 0;
+        m_results.clear();
+        m_results.reserve(texts.size());
+
+        start_next_batch_async();
+    }
+
+    std::vector<std::pair<size_t, float>> wait_rerank() {
+        while (m_inflight > 0) {
+            m_request.wait();
+
+            // postprocessing applied to output, it's the scores tensor
+            const auto scores_tensor = m_request.get_tensor("logits");
+            const auto* scores_data = scores_tensor.data<float>();
+
+            const size_t first_doc = m_next_doc - m_inflight;
+            for (size_t i = 0; i < m_inflight; i++) {
+                m_results.emplace_back(first_doc + i, scores_data[i]);
+            }
+
+            if (m_has_beam_idx) {
+                m_request.reset_state();
+            }
+
+            m_inflight = 0;
+            start_next_batch_async();
+        }
+
+        return sort_and_trim(std::move(m_results));
+    }
+
+private:
+    // Scores the next m_batch_limit documents in a single infer. On devices with a static batch
+    // size of 1 (NPU) documents are scored one infer at a time and the scores are aggregated in
+    // wait_rerank(); on other devices the whole input forms one batch, so start/wait behave
+    // exactly as a single batched infer.
+    void start_next_batch_async() {
+        if (m_next_doc >= m_texts.size()) {
+            return;
+        }
+
+        const size_t batch_size = std::min(m_batch_limit, m_texts.size() - m_next_doc);
+        const auto batch_begin = m_texts.begin() + m_next_doc;
+        const std::vector<std::string> batch(batch_begin, batch_begin + batch_size);
+
+        const TokenizedInputs& encoded = tokenize(m_query, batch);
 
         m_request.set_tensor("input_ids", encoded.input_ids);
         m_request.set_tensor("attention_mask", encoded.attention_mask);
@@ -230,61 +293,16 @@ public:
         }
 
         if (m_has_beam_idx) {
-            const size_t batch_size = encoded.input_ids.get_shape()[0];
-            ov::Tensor beam_idx = ov::Tensor(ov::element::i32, {batch_size});
-            std::fill_n(beam_idx.data<int32_t>(), batch_size, 0);
+            const size_t input_batch = encoded.input_ids.get_shape()[0];
+            ov::Tensor beam_idx = ov::Tensor(ov::element::i32, {input_batch});
+            std::fill_n(beam_idx.data<int32_t>(), input_batch, 0);
             m_request.set_tensor("beam_idx", beam_idx);
         }
 
         m_request.start_async();
-    }
 
-    std::vector<std::pair<size_t, float>> wait_rerank() {
-        m_request.wait();
-
-        // postprocessing applied to output, it's the scores tensor
-        auto scores_tensor = m_request.get_tensor("logits");
-        auto scores_tensor_shape = scores_tensor.get_shape();
-        const size_t batch_size = scores_tensor_shape[0];
-
-        auto scores_data = scores_tensor.data<float>();
-
-        std::vector<std::pair<size_t, float>> results;
-        results.reserve(batch_size);
-
-        for (size_t batch = 0; batch < batch_size; batch++) {
-            results.emplace_back(batch, scores_data[batch]);
-        }
-
-        if (m_has_beam_idx) {
-            m_request.reset_state();
-        }
-
-        return sort_and_trim(std::move(results));
-    }
-
-private:
-    // Score documents one at a time. Used on devices that only support a batch size of 1 (NPU):
-    // each document is run through its own infer, then all scores are aggregated and ranked the
-    // same way as the batched path.
-    std::vector<std::pair<size_t, float>> rerank_per_document(const std::string& query,
-                                                              const std::vector<std::string>& texts) {
-        std::vector<std::pair<size_t, float>> results;
-        results.reserve(texts.size());
-
-        for (size_t doc = 0; doc < texts.size(); ++doc) {
-            start_rerank_async(query, {texts[doc]});
-            m_request.wait();
-
-            auto scores_tensor = m_request.get_tensor("logits");
-            results.emplace_back(doc, scores_tensor.data<float>()[0]);
-
-            if (m_has_beam_idx) {
-                m_request.reset_state();
-            }
-        }
-
-        return sort_and_trim(std::move(results));
+        m_next_doc += batch_size;
+        m_inflight = batch_size;
     }
 
     std::vector<std::pair<size_t, float>> sort_and_trim(std::vector<std::pair<size_t, float>> results) {
@@ -311,7 +329,14 @@ private:
     AnyMap m_tokenization_params;
     bool m_has_position_ids = false;
     bool m_has_beam_idx = false;
-    bool m_per_document = false;
+    // Maximum number of documents scored per infer: 1 on NPU, unbounded elsewhere.
+    size_t m_batch_limit = std::numeric_limits<size_t>::max();
+    // Rerank state shared between start_rerank_async() and wait_rerank().
+    std::string m_query;
+    std::vector<std::string> m_texts;
+    size_t m_next_doc = 0;
+    size_t m_inflight = 0;
+    std::vector<std::pair<size_t, float>> m_results;
 
     TokenizedInputs tokenize(const std::string& query, const std::vector<std::string>& texts) {
         if (m_tokenizer.supports_paired_input()) {
