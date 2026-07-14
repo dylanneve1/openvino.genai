@@ -27,6 +27,27 @@ void log_paged_attention_fallback(const ov::Exception& exception) {
     GENAI_DEBUG("Paged Attention backend initialization error: %s", exception.what());
 }
 
+// The NPU PA front-end (npuw::PACompiledModel) is driven by the CB/PA pipeline:
+// the CB pipeline applies SDPAToPagedAttention and its KV-cache manager owns the
+// paged cache tensors PACompiledModel dispatches over. When NPUW_PA is requested
+// on NPU we therefore route to the CB adapter instead of the stateful NPU
+// pipeline (which would inject NPUW_LLM and never produce a PA model).
+bool requests_npuw_pa(const ov::AnyMap& properties) {
+    const auto it = properties.find("NPUW_PA");
+    if (it == properties.end()) {
+        return false;
+    }
+    const auto& value = it->second;
+    if (value.is<bool>()) {
+        return value.as<bool>();
+    }
+    if (value.is<std::string>()) {
+        const std::string s = value.as<std::string>();
+        return s == "YES" || s == "yes" || s == "true" || s == "TRUE" || s == "True" || s == "1";
+    }
+    return false;
+}
+
 // This is a decorator function that wraps a generation callable to apply parsers and reset them before generation if needed.
 ov::genai::DecodedResults run_generate_with_parsers(const ov::genai::OptionalGenerationConfig& generation_config,
                  const ov::genai::StreamerVariant& streamer,
@@ -214,14 +235,17 @@ ov::genai::LLMPipeline::LLMPipeline(
 
     bool is_npu_requested = ov::genai::utils::is_npu_requested(device, user_properties);
     auto [properties, attention_backend] = utils::extract_attention_backend(user_properties, is_npu_requested);
+    // NPU + NPUW_PA: drive PACompiledModel through the CB/PA pipeline (below)
+    // instead of the stateful NPU pipeline.
+    const bool npu_pa_frontend = is_npu_requested && requests_npuw_pa(user_properties);
     utils::extract_extensions_to_core(properties);
 
     std::shared_ptr<ov::Model> model = utils::read_model(models_path, properties);
 
     const auto generation_config = utils::from_config_json_if_exists(models_path);
-    if (is_npu_requested) {
+    if (is_npu_requested && !npu_pa_frontend) {
         m_pimpl = StatefulPipeline::create(model, tokenizer, device, properties, generation_config, models_path);
-    } else if (utils::explicitly_requires_paged_attention(user_properties)) {
+    } else if (npu_pa_frontend || utils::explicitly_requires_paged_attention(user_properties)) {
         // If CB is invoked explicitly, create CB adapter as is and re-throw in case if internal issues
         auto [device_properties, scheduler_config] = utils::extract_scheduler_config(properties, utils::get_latency_oriented_scheduler_config());
         m_pimpl = std::make_unique<ContinuousBatchingAdapter>(model, tokenizer, scheduler_config, device, device_properties, generation_config, models_path);
@@ -256,6 +280,9 @@ ov::genai::LLMPipeline::LLMPipeline(
 
     bool is_npu_requested = ov::genai::utils::is_npu_requested(device, user_properties);
     auto [properties, attention_backend] = utils::extract_attention_backend(user_properties, is_npu_requested);
+    // NPU + NPUW_PA: drive PACompiledModel through the CB/PA pipeline (below)
+    // instead of the stateful NPU pipeline.
+    const bool npu_pa_frontend = is_npu_requested && requests_npuw_pa(user_properties);
     utils::extract_extensions_to_core(properties);
 
     // Read model and create tokenizer once to avoid double I/O during pipeline construction.
@@ -263,9 +290,9 @@ ov::genai::LLMPipeline::LLMPipeline(
     const Tokenizer tokenizer(models_path, properties);
 
     const auto generation_config = utils::from_config_json_if_exists(models_path);
-    if (is_npu_requested) {
+    if (is_npu_requested && !npu_pa_frontend) {
         m_pimpl = StatefulPipeline::create(model, tokenizer, device, properties, generation_config, models_path);
-    } else if (utils::explicitly_requires_paged_attention(user_properties)) {
+    } else if (npu_pa_frontend || utils::explicitly_requires_paged_attention(user_properties)) {
         // If CB is invoked explicitly, create CB adapter as is and re-throw in case if internal issues
         auto [device_properties, scheduler_config] = utils::extract_scheduler_config(properties, utils::get_latency_oriented_scheduler_config());
         m_pimpl = std::make_unique<ContinuousBatchingAdapter>(model, tokenizer, scheduler_config, device, device_properties, generation_config, models_path);
@@ -304,18 +331,21 @@ ov::genai::LLMPipeline::LLMPipeline(
 
     bool is_npu_requested = ov::genai::utils::is_npu_requested(device, user_properties);
     auto [properties, attention_backend] = utils::extract_attention_backend(user_properties, is_npu_requested);
+    // NPU + NPUW_PA: drive PACompiledModel through the CB/PA pipeline (below)
+    // instead of the stateful NPU pipeline.
+    const bool npu_pa_frontend = is_npu_requested && requests_npuw_pa(user_properties);
     utils::extract_extensions_to_core(properties);
 
     std::shared_ptr<ov::Model> model = utils::singleton_core().read_model(model_str, weights_tensor);
 
-    if (is_npu_requested) {
+    if (is_npu_requested && !npu_pa_frontend) {
         m_pimpl = StatefulPipeline::create(
             model,
             tokenizer,
             device,
             properties,
             generation_config);
-    } else if (utils::explicitly_requires_paged_attention(user_properties)) {
+    } else if (npu_pa_frontend || utils::explicitly_requires_paged_attention(user_properties)) {
         // If CB is invoked explicitly, create CB adapter as is and re-throw in case if internal issues
         auto [device_properties, scheduler_config] = utils::extract_scheduler_config(properties, utils::get_latency_oriented_scheduler_config());
         m_pimpl = std::make_unique<ContinuousBatchingAdapter>(model, tokenizer, scheduler_config, device, device_properties, generation_config);
