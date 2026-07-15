@@ -34,18 +34,7 @@ void log_paged_attention_fallback(const ov::Exception& exception) {
 // pipeline (which would inject NPUW_LLM and never produce a PA model).
 bool requests_npuw_pa(const ov::AnyMap& properties) {
     const auto it = properties.find("NPUW_PA");
-    if (it == properties.end()) {
-        return false;
-    }
-    const auto& value = it->second;
-    if (value.is<bool>()) {
-        return value.as<bool>();
-    }
-    if (value.is<std::string>()) {
-        const std::string s = value.as<std::string>();
-        return s == "YES" || s == "yes" || s == "true" || s == "TRUE" || s == "True" || s == "1";
-    }
-    return false;
+    return it != properties.end() && it->second.as<bool>();
 }
 
 // This is a decorator function that wraps a generation callable to apply parsers and reset them before generation if needed.
